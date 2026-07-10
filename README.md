@@ -1,41 +1,24 @@
-This README file contains information on the contents of the meta-fieldbus layer.
+# meta-fieldbus
 
-Please see the corresponding sections below for details.
+Yocto meta-layer for a deterministic Modbus RTU fieldbus on PREEMPT_RT.
 
-Dependencies
-============
+## What this builds
+- PREEMPT_RT 6.12 kernel (raspberry Pi 3B+)
+- In-kernel serdev Modbus RTU driver (/dev/modbus0)
+  - hrtimer-based 1.75ms inter-frame silence (fixed, per spec >19200 baud)
+  - CRC16 validation, kfifo buffering, sysfs stats
+- Device tree overlay binding uart0 to the driver
+- SCHED_DEADLINE 100Hz scan-cycle master (modbus_master)
 
-  URI: <first dependency>
-  branch: <branch name>
+## Hardware
+- Raspberry Pi 3B+ (master)
+- STM32 Nucleo-F446RE (bare-metal slave, USART1)
+- RS485 auto-direction modules x2
+- 24MHz logic analyzer for wire-level jitter measurement
 
-  URI: <second dependency>
-  branch: <branch name>
+## Layer dependencies
+- poky (walnascar)
+- meta-raspberrypi (walnascar)
 
-  .
-  .
-  .
-
-Patches
-=======
-
-Please submit any patches against the meta-fieldbus layer to the xxxx mailing list (xxxx@zzzz.org)
-and cc: the maintainer:
-
-Maintainer: XXX YYYYYY <xxx.yyyyyy@zzzzz.com>
-
-Table of Contents
-=================
-
-  I. Adding the meta-fieldbus layer to your build
- II. Misc
-
-
-I. Adding the meta-fieldbus layer to your build
-=================================================
-
-Run 'bitbake-layers add-layer meta-fieldbus'
-
-II. Misc
-========
-
---- replace with specific information about the meta-fieldbus layer ---
+## Build
+See docs/ for full setup instructions.
