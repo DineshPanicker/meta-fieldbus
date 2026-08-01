@@ -10,6 +10,7 @@
 #include <linux/hrtimer.h>         /* high-resolution timer for the 1.75ms T3.5 silence detector */
 #include <linux/ktime.h>           /* ktime_get_ns() for frame timestamps */
 #include <linux/wait.h>            /* wait_queue_head_t, wait_event_interruptible(), wake_up_interruptible() */
+#include <linux/device.h>
 
 #define MODBUS_T35_NS (1750000ULL) /* 1.75 ms, fixed per spec >19200 baud: max inter-byte gap within one frame */
 #define MODBUS_MAX_FRAME 256       /* max size of one Modbus RTU frame */
@@ -28,15 +29,18 @@ struct modbus_record
 /* Per-device driver state; one instance per bound serdev_device. */
 struct modbus_priv
 {
-    struct serdev_device *serdev; /* underlying serial device */
-    struct miscdevice miscdev;    /* embedded misc-device registration; exposes /dev/modbus0 */
+    struct serdev_device *serdev;
+    struct miscdevice miscdev;
 
-    struct hrtimer t35_timer;   /* fires when 1.75ms of silence has passed -- signals "frame complete" */
-    u8 rxbuf[MODBUS_MAX_FRAME]; /* in-progress frame being assembled by modbus_receive_buf() */
-    size_t rxlen;               /* number of valid bytes currently in rxbuf */
+    struct hrtimer t35_timer;
+    u8 rxbuf[MODBUS_MAX_FRAME];
+    size_t rxlen;
 
-    struct kfifo fifo;       /* ring buffer of completed struct modbus_record entries */
-    wait_queue_head_t readq; /* wakes blocked read() callers when a new record lands in fifo */
+    struct kfifo fifo;
+    wait_queue_head_t readq;
+
+    atomic_t frames_ok;  /* 4d */
+    atomic_t crc_errors; /* 4d */
 };
 
 /* Standard Modbus CRC16 (polynomial 0xA001, init 0xFFFF), computed over
@@ -86,22 +90,20 @@ static enum hrtimer_restart modbus_t35_expired(struct hrtimer *t)
 
     if (rx_crc != calc_crc)
     {
-        priv->rxlen = 0; /* bad frame (noise, collision, etc.) -- drop it (4d will count this) */
+        atomic_inc(&priv->crc_errors); /* 4d */
+        priv->rxlen = 0;
         return HRTIMER_NORESTART;
     }
 
-    /* Frame is valid: snapshot it into a record for the fifo. */
     rec.ts_ns = ktime_get_ns();
     rec.len = priv->rxlen;
     memcpy(rec.data, priv->rxbuf, priv->rxlen);
 
-    /* Only push if there's room for a whole record, else silently drop it
-     * (a slow/absent reader shouldn't corrupt the fifo or block this timer).
-     */
     if (kfifo_avail(&priv->fifo) >= sizeof(rec))
     {
         kfifo_in(&priv->fifo, &rec, sizeof(rec));
-        wake_up_interruptible(&priv->readq); /* wake any read() blocked waiting for data */
+        atomic_inc(&priv->frames_ok); /* 4d */
+        wake_up_interruptible(&priv->readq);
     }
 
     priv->rxlen = 0;          /* reset the assembly buffer for the next frame */
@@ -209,7 +211,33 @@ static const struct file_operations modbus_fops = {
     .read = modbus_read,
     .write = modbus_write,
 };
+/* --- 4d: sysfs counters under /sys/class/misc/modbus0/ --- */
+static ssize_t frames_ok_show(struct device *dev,
+                              struct device_attribute *attr, char *buf)
+{
+    struct miscdevice *m = dev_get_drvdata(dev);
+    struct modbus_priv *priv = container_of(m, struct modbus_priv, miscdev);
 
+    return sysfs_emit(buf, "%d\n", atomic_read(&priv->frames_ok));
+}
+static DEVICE_ATTR_RO(frames_ok);
+
+static ssize_t crc_errors_show(struct device *dev,
+                               struct device_attribute *attr, char *buf)
+{
+    struct miscdevice *m = dev_get_drvdata(dev);
+    struct modbus_priv *priv = container_of(m, struct modbus_priv, miscdev);
+
+    return sysfs_emit(buf, "%d\n", atomic_read(&priv->crc_errors));
+}
+static DEVICE_ATTR_RO(crc_errors);
+
+static struct attribute *modbus_attrs[] = {
+    &dev_attr_frames_ok.attr,
+    &dev_attr_crc_errors.attr,
+    NULL,
+};
+ATTRIBUTE_GROUPS(modbus);
 /* Called when a serdev device matching modbus_of_match is bound to this driver. */
 static int modbus_probe(struct serdev_device *sdev)
 {
@@ -250,6 +278,7 @@ static int modbus_probe(struct serdev_device *sdev)
     priv->miscdev.name = "modbus0";
     priv->miscdev.fops = &modbus_fops;
     priv->miscdev.mode = 0666;
+    priv->miscdev.groups = modbus_groups; /* 4d */
     ret = misc_register(&priv->miscdev);
     if (ret)
         goto err_close;
