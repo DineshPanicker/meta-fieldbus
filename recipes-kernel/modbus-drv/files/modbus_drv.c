@@ -1,38 +1,122 @@
-#include <linux/module.h>
-#include <linux/mod_devicetable.h>
-#include <linux/of.h>
-#include <linux/serdev.h>
-#include <linux/miscdevice.h>
-#include <linux/fs.h>
-#include <linux/uaccess.h>
+/* modbus_drv.c -- increment 4c: hrtimer t3.5 frame detection + CRC16 + kfifo */
+#include <linux/module.h>          /* core header for loadable kernel modules */
+#include <linux/mod_devicetable.h> /* struct of_device_id */
+#include <linux/of.h>              /* devicetree matching helpers */
+#include <linux/serdev.h>          /* serdev_device, serdev_device_ops, module_serdev_device_driver() */
+#include <linux/miscdevice.h>      /* struct miscdevice, misc_register()/misc_deregister() */
+#include <linux/fs.h>              /* struct file, struct file_operations */
+#include <linux/uaccess.h>         /* copy_to_user()/copy_from_user() */
+#include <linux/kfifo.h>           /* lock-free single-producer/single-consumer ring buffer */
+#include <linux/hrtimer.h>         /* high-resolution timer for the 1.75ms T3.5 silence detector */
+#include <linux/ktime.h>           /* ktime_get_ns() for frame timestamps */
+#include <linux/wait.h>            /* wait_queue_head_t, wait_event_interruptible(), wake_up_interruptible() */
 
-#define MODBUS_MAX_FRAME 256 /* max size of one Modbus RTU frame we'll buffer in either direction */
+#define MODBUS_T35_NS (1750000ULL) /* 1.75 ms, fixed per spec >19200 baud: max inter-byte gap within one frame */
+#define MODBUS_MAX_FRAME 256       /* max size of one Modbus RTU frame */
+#define FIFO_SIZE 4096             /* bytes; must be a power of two (kfifo requirement) */
 
-/* Per-device driver state. One instance is allocated per serdev_device that
- * matches this driver (see modbus_probe()).
+/* One complete, CRC-validated frame, handed from timer context (producer)
+ * to a blocking read() in process context (consumer) via the kfifo below.
  */
-struct modbus_priv
+struct modbus_record
 {
-    struct serdev_device *serdev; /* back-pointer to the underlying serial device, used to read/write the UART */
-    struct miscdevice miscdev;    /* embedded misc-device registration; exposes this instance as /dev/modbusN */
-    u8 rxbuf[MODBUS_MAX_FRAME];   /* accumulates bytes received from the serial line until userspace reads them */
-    size_t rxlen;                 /* number of valid bytes currently sitting in rxbuf */
+    u64 ts_ns;                 /* time the frame was recognized as complete (your T2) */
+    u16 len;                   /* number of valid bytes in data[] */
+    u8 data[MODBUS_MAX_FRAME]; /* raw frame bytes, including the trailing CRC */
 };
 
-/* serdev callback: invoked by the serial core whenever new bytes arrive on
- * the UART for this device. Runs in the serdev driver's receive context,
- * not in a userspace read() call.
- *   sdev  - the serial device that received data
- *   buf   - newly arrived raw bytes (owned by the framework, valid only during this call)
- *   count - number of bytes available in buf
- * Returns the number of bytes consumed; serdev redelivers whatever isn't
- * consumed, so returning less than count is valid backpressure.
+/* Per-device driver state; one instance per bound serdev_device. */
+struct modbus_priv
+{
+    struct serdev_device *serdev; /* underlying serial device */
+    struct miscdevice miscdev;    /* embedded misc-device registration; exposes /dev/modbus0 */
+
+    struct hrtimer t35_timer;   /* fires when 1.75ms of silence has passed -- signals "frame complete" */
+    u8 rxbuf[MODBUS_MAX_FRAME]; /* in-progress frame being assembled by modbus_receive_buf() */
+    size_t rxlen;               /* number of valid bytes currently in rxbuf */
+
+    struct kfifo fifo;       /* ring buffer of completed struct modbus_record entries */
+    wait_queue_head_t readq; /* wakes blocked read() callers when a new record lands in fifo */
+};
+
+/* Standard Modbus CRC16 (polynomial 0xA001, init 0xFFFF), computed over
+ * buf[0..len-1]. Modbus transmits the result little-endian as the frame's
+ * last two bytes.
+ */
+static u16 modbus_crc16(const u8 *buf, size_t len)
+{
+    u16 crc = 0xFFFF; /* CRC register, seeded per spec */
+    size_t i;
+    int b;
+
+    for (i = 0; i < len; i++)
+    {
+        crc ^= buf[i]; /* XOR next byte into the low byte of the CRC register */
+        for (b = 0; b < 8; b++)
+            /* Shift right once per bit; XOR the poly in only when the bit shifted out was 1. */
+            crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : (crc >> 1);
+    }
+    return crc;
+}
+
+/* hrtimer callback: fires exactly MODBUS_T35_NS after the last received
+ * byte, provided no newer byte re-armed the timer in the meantime (see
+ * modbus_receive_buf()). That silence is what Modbus RTU defines as the
+ * frame boundary. Runs in softirq/hrtimer context on PREEMPT_RT, not
+ * process context -- keep this fast and avoid sleeping.
+ */
+static enum hrtimer_restart modbus_t35_expired(struct hrtimer *t)
+{
+    /* Recover the owning modbus_priv from the embedded hrtimer pointer. */
+    struct modbus_priv *priv = container_of(t, struct modbus_priv, t35_timer);
+    struct modbus_record rec;
+    u16 rx_crc, calc_crc;
+
+    if (priv->rxlen < 4)
+    { /* addr + func + crc(2) is the minimum possible frame; too short to be valid */
+        priv->rxlen = 0;
+        return HRTIMER_NORESTART;
+    }
+
+    /* Modbus RTU appends CRC16 little-endian as the last two bytes of the frame. */
+    rx_crc = priv->rxbuf[priv->rxlen - 2] |
+             (priv->rxbuf[priv->rxlen - 1] << 8);
+    /* Recompute the CRC over everything except those trailing CRC bytes. */
+    calc_crc = modbus_crc16(priv->rxbuf, priv->rxlen - 2);
+
+    if (rx_crc != calc_crc)
+    {
+        priv->rxlen = 0; /* bad frame (noise, collision, etc.) -- drop it (4d will count this) */
+        return HRTIMER_NORESTART;
+    }
+
+    /* Frame is valid: snapshot it into a record for the fifo. */
+    rec.ts_ns = ktime_get_ns();
+    rec.len = priv->rxlen;
+    memcpy(rec.data, priv->rxbuf, priv->rxlen);
+
+    /* Only push if there's room for a whole record, else silently drop it
+     * (a slow/absent reader shouldn't corrupt the fifo or block this timer).
+     */
+    if (kfifo_avail(&priv->fifo) >= sizeof(rec))
+    {
+        kfifo_in(&priv->fifo, &rec, sizeof(rec));
+        wake_up_interruptible(&priv->readq); /* wake any read() blocked waiting for data */
+    }
+
+    priv->rxlen = 0;          /* reset the assembly buffer for the next frame */
+    return HRTIMER_NORESTART; /* one-shot: modbus_receive_buf() re-arms it on the next byte */
+}
+
+/* serdev RX callback: invoked by the serial core for every chunk of bytes
+ * arriving on the UART. Buffers them and (re)arms the silence timer so
+ * that MODBUS_T35_NS of quiet after the last byte triggers frame completion.
  */
 static size_t modbus_receive_buf(struct serdev_device *sdev,
                                  const u8 *buf, size_t count)
 {
     struct modbus_priv *priv = serdev_device_get_drvdata(sdev);
-    size_t space = sizeof(priv->rxbuf) - priv->rxlen;
+    size_t space = sizeof(priv->rxbuf) - priv->rxlen; /* remaining room in rxbuf */
     size_t n = min(count, space);
 
     if (n)
@@ -41,96 +125,120 @@ static size_t modbus_receive_buf(struct serdev_device *sdev,
         priv->rxlen += n;
     }
 
-    /* Buffer full with no framing yet (4b): drop to avoid livelock.
-     * 4c's t3.5 timer will drain the buffer and this won't trigger. */
-    if (n < count)
-    {
-        priv->rxlen = 0; /* discard and restart */
-        return count;    /* tell serdev we consumed everything */
-    }
+    /* Any byte -- valid or not -- re-arms the 1.75 ms silence timer; this
+     * is the actual RTU framing rule (frame ends on inter-byte silence,
+     * not on any particular byte pattern).
+     */
+    hrtimer_start(&priv->t35_timer, ns_to_ktime(MODBUS_T35_NS),
+                  HRTIMER_MODE_REL);
 
-    return n; /* consumed n bytes */
+    if (n < count)
+    {                    /* rxbuf overflowed: frame is longer than we can hold */
+        priv->rxlen = 0; /* drop the partial frame */
+        return count;    /* still claim all bytes consumed so serdev doesn't redeliver them */
+    }
+    return n;
 }
 
-/* Callback table handed to the serdev core so it knows how to notify this
- * driver of incoming data. This is the serdev analogue of file_operations.
- */
+/* Wires modbus_receive_buf() into the serdev core as the RX callback. */
 static const struct serdev_device_ops modbus_serdev_ops = {
-    .receive_buf = modbus_receive_buf, /* called on every chunk of incoming UART data */
+    .receive_buf = modbus_receive_buf,
 };
 
-/* read() handler for /dev/modbusN: hands buffered RX bytes to userspace. */
+/* read() handler for /dev/modbus0: returns exactly one complete, validated
+ * frame record per call, blocking until one is available unless O_NONBLOCK
+ * was set on open.
+ */
 static ssize_t modbus_read(struct file *f, char __user *ubuf,
                            size_t len, loff_t *off)
 {
-    /* f->private_data was set to &priv->miscdev by the misc-device open path;
-     * container_of walks back from that embedded member to the enclosing
-     * modbus_priv so we can reach rxbuf/rxlen.
+    /* f->private_data points at the embedded miscdevice; recover the
+     * enclosing modbus_priv to reach the fifo/waitqueue.
      */
     struct modbus_priv *priv = container_of(f->private_data,
                                             struct modbus_priv, miscdev);
-    ssize_t ret;
+    struct modbus_record rec;
+    unsigned int copied;
+    int ret;
 
-    /* Copy out of rxbuf starting at *off, advancing *off as bytes are consumed. */
-    ret = simple_read_from_buffer(ubuf, len, off, priv->rxbuf, priv->rxlen);
-    /* Once the caller has read past the end of the buffered data, reset the
-     * buffer so the next receive_buf() call starts a fresh frame at offset 0.
-     */
-    if (ret > 0 && *off >= (loff_t)priv->rxlen)
-        priv->rxlen = 0;
-    return ret;
+    if (kfifo_is_empty(&priv->fifo))
+    {
+        if (f->f_flags & O_NONBLOCK)
+            return -EAGAIN; /* caller asked not to block; nothing ready yet */
+        /* Sleep until modbus_t35_expired() pushes a record and wakes readq. */
+        ret = wait_event_interruptible(priv->readq,
+                                       !kfifo_is_empty(&priv->fifo));
+        if (ret)
+            return ret; /* interrupted by a signal */
+    }
+
+    /* Pop exactly one record out of the fifo. */
+    copied = kfifo_out(&priv->fifo, &rec, sizeof(rec));
+    if (copied != sizeof(rec))
+        return -EIO; /* shouldn't happen: fifo only ever holds whole records */
+
+    /* Never hand back more than the record actually occupies. */
+    if (len > sizeof(rec))
+        len = sizeof(rec);
+    if (copy_to_user(ubuf, &rec, len))
+        return -EFAULT;
+    return len;
 }
 
-/* write() handler for /dev/modbusN: forwards a userspace buffer out over the
- * serial line, e.g. to send a Modbus RTU request frame.
+/* write() handler for /dev/modbus0: forwards a userspace buffer out over
+ * the serial line as-is (e.g. a Modbus RTU request the caller already built,
+ * CRC included).
  */
-static ssize_t modbus_write(struct file *f, const char __user *ubuf, size_t len, loff_t *off)
+static ssize_t modbus_write(struct file *f, const char __user *ubuf,
+                            size_t len, loff_t *off)
 {
-    struct modbus_priv *priv = container_of(f->private_data, struct modbus_priv, miscdev);
+    struct modbus_priv *priv = container_of(f->private_data,
+                                            struct modbus_priv, miscdev);
     u8 tx[MODBUS_MAX_FRAME]; /* kernel-space staging buffer for the outgoing frame */
 
-    /* Reject writes larger than we can stage; keeps memcpy/copy_from_user bounded. */
     if (len > sizeof(tx))
-        return -EINVAL;
-    /* Safely copy the frame from user space into the kernel buffer. */
+        return -EINVAL; /* reject anything we can't stage */
     if (copy_from_user(tx, ubuf, len))
         return -EFAULT;
-    /* Hand the bytes to the serdev core to transmit on the UART. */
     return serdev_device_write_buf(priv->serdev, tx, len);
 }
 
-/* File operations exposed at /dev/modbusN. */
+/* File operations exposed at /dev/modbus0. */
 static const struct file_operations modbus_fops = {
-    .owner = THIS_MODULE, /* ties this fops to the module for refcounting, prevents unload while open */
+    .owner = THIS_MODULE,
     .read = modbus_read,
     .write = modbus_write,
 };
 
-/* Called by the serdev/device-tree core when a device matching
- * modbus_of_match is found and bound to this driver.
- */
+/* Called when a serdev device matching modbus_of_match is bound to this driver. */
 static int modbus_probe(struct serdev_device *sdev)
 {
     struct modbus_priv *priv;
     int ret;
 
-    /* Allocate state that's automatically freed when sdev is removed
-     * (devm_ ties the allocation's lifetime to the device).
-     */
+    /* devm_ ties this allocation's lifetime to sdev; freed automatically on remove. */
     priv = devm_kzalloc(&sdev->dev, sizeof(*priv), GFP_KERNEL);
     if (!priv)
         return -ENOMEM;
 
     priv->serdev = sdev;
-    /* Attach priv to sdev so later callbacks (receive_buf, remove) can fetch it back. */
-    serdev_device_set_drvdata(sdev, priv);
-    /* Register our receive_buf callback with the serdev core. */
-    serdev_device_set_client_ops(sdev, &modbus_serdev_ops);
+    serdev_device_set_drvdata(sdev, priv);                  /* so later callbacks can fetch priv back */
+    serdev_device_set_client_ops(sdev, &modbus_serdev_ops); /* register RX callback */
+
+    /* Allocate the ring buffer that holds completed frame records. */
+    ret = kfifo_alloc(&priv->fifo, FIFO_SIZE, GFP_KERNEL);
+    if (ret)
+        return ret;
+
+    init_waitqueue_head(&priv->readq); /* used to block/wake read() callers */
+    /* Set up (but don't yet start) the T3.5 silence-detection timer. using the legacy form */
+    hrtimer_init(&priv->t35_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+    priv->t35_timer.function = modbus_t35_expired;
 
     /* Open the underlying UART/tty for this serdev device. */
     ret = serdev_device_open(sdev);
     if (ret)
-        return ret;
+        goto err_fifo;
 
     /* Configure the line for Modbus RTU: 115200 baud, 8N1, no flow control. */
     serdev_device_set_baudrate(sdev, 115200);
@@ -138,21 +246,22 @@ static int modbus_probe(struct serdev_device *sdev)
     serdev_device_set_parity(sdev, SERDEV_PARITY_NONE);
 
     /* Fill in the embedded miscdevice and register /dev/modbus0. */
-    priv->miscdev.minor = MISC_DYNAMIC_MINOR; /* let the kernel pick a free minor number */
-    priv->miscdev.name = "modbus0";           /* device node will appear as /dev/modbus0 */
+    priv->miscdev.minor = MISC_DYNAMIC_MINOR;
+    priv->miscdev.name = "modbus0";
     priv->miscdev.fops = &modbus_fops;
-    priv->miscdev.mode = 0666; /* rw for all users */
+    priv->miscdev.mode = 0666;
     ret = misc_register(&priv->miscdev);
     if (ret)
         goto err_close;
 
-    dev_info(&sdev->dev, "modbus-rtu: probed on %s, 115200 8N1\n",
+    dev_info(&sdev->dev, "modbus-rtu: ready on %s, 115200 8N1, t3.5=1.75ms\n",
              dev_name(&sdev->dev));
     return 0;
 
 err_close:
-    /* Registration failed: undo the open() before returning the error. */
-    serdev_device_close(sdev);
+    serdev_device_close(sdev); /* undo serdev_device_open() */
+err_fifo:
+    kfifo_free(&priv->fifo); /* undo kfifo_alloc() */
     return ret;
 }
 
@@ -161,8 +270,10 @@ static void modbus_remove(struct serdev_device *sdev)
 {
     struct modbus_priv *priv = serdev_device_get_drvdata(sdev);
 
-    misc_deregister(&priv->miscdev); /* remove /dev/modbus0 */
-    serdev_device_close(sdev);       /* close the UART */
+    hrtimer_cancel(&priv->t35_timer); /* stop the timer before freeing state it references */
+    misc_deregister(&priv->miscdev);  /* remove /dev/modbus0 */
+    serdev_device_close(sdev);        /* close the UART */
+    kfifo_free(&priv->fifo);          /* release the ring buffer */
     dev_info(&sdev->dev, "modbus-rtu: removed\n");
 }
 
@@ -184,6 +295,6 @@ static struct serdev_device_driver modbus_driver = {
 /* Generates module_init()/module_exit() that register/unregister modbus_driver. */
 module_serdev_device_driver(modbus_driver);
 
-MODULE_LICENSE("GPL"); /* required for the module to use GPL-only kernel symbols */
+MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Dinesh Sreekumar Panicker");
-MODULE_DESCRIPTION("Increment 4b: serdev binding for Modbus RTU on RS485");
+MODULE_DESCRIPTION("Increment 4c: Modbus RTU frame detection on RS485");
