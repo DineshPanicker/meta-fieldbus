@@ -1,3 +1,5 @@
 # WiFi credentials hardcoded in recipe - never commit
 recipes-connectivity/
+recipes-core/
 .vscode/
+.metadata/
