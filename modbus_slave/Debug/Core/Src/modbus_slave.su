@@ -1,0 +1,7 @@
+../Core/Src/modbus_slave.c:29:17:modbus_crc16	24	static
+../Core/Src/modbus_slave.c:41:6:HAL_UART_RxCpltCallback	16	static
+../Core/Src/modbus_slave.c:55:13:reset_rx	4	static
+../Core/Src/modbus_slave.c:62:13:modbus_poll_frame_timeout	8	static
+../Core/Src/modbus_slave.c:70:13:modbus_handle_frame	48	static
+../Core/Src/modbus_slave.c:110:6:modbus_slave_init	8	static
+../Core/Src/modbus_slave.c:115:6:modbus_slave_task	8	static
