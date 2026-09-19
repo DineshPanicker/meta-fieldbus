@@ -1,6 +1,0 @@
-PTEST_ENABLED = "0"
-RDEPENDS:${PN}-ptest = ""
-EXTRA_OECONF:remove = "--enable-tests"
-EXTRA_OEMESON:remove = "-Dtests=enabled"
-do_install_ptest_base[noexec] = "1"
-do_install_ptest[noexec] = "1"

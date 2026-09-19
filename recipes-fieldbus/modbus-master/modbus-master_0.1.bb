@@ -4,15 +4,11 @@ LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda
 
 SRC_URI = "file://modbus_master.c"
 
-S = "${WORKDIR}/sources"
-UNPACKDIR = "${S}"
-
-DEPENDS = "libgpiod"
-RDEPENDS:${PN} = "libgpiod"
+S = "${WORKDIR}"
 
 do_compile() {
     ${CC} ${CFLAGS} ${LDFLAGS} -Wall -Wextra -O2 \
-        -o modbus_master modbus_master.c -lgpiod
+        -o modbus_master modbus_master.c
 }
 
 do_install() {

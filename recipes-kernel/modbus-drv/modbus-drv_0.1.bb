@@ -8,7 +8,6 @@ SRC_URI = "file://modbus_drv.c \
            file://Makefile \
            "
 
-S = "${WORKDIR}/sources"
-UNPACKDIR = "${S}"
+S = "${WORKDIR}"
 
 RPROVIDES:${PN} += "kernel-module-modbus-drv"
