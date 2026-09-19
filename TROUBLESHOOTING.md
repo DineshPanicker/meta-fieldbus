@@ -363,6 +363,200 @@ subsystem docs/headers for what a callback's return is expected to mean.
 
 ---
 
+## The Debian / scarthgap rebuild (host migration)
+
+The Ubuntu host became unusable and the project was rebuilt from scratch on Debian
+13 (trixie), and the release moved from walnascar to scarthgap (LTS) at the same
+time. This section covers what that migration surfaced — including the real
+resolution of the pseudo saga (YOCTO-5), which turned out to be a host-kernel
+problem all along.
+
+### MIG-1 — pseudo failure RESOLVED by the host-kernel change
+
+**Background.** On the Ubuntu host (kernel 6.17), `do_package`/`do_install`
+repeatedly failed with `chown: Invalid argument` — first on the driver, then
+wpa-supplicant, then core toolchain recipes (gcc-runtime, gcc-sanitizers). Config
+tweaks (`PSEUDO_PATHS_CHECK`, `PSEUDO_ALTPATH`), cleans, and pseudo-native rebuilds
+all failed. It blocked every full image build; the workaround was cross-compile +
+SCP of individual artifacts, never a packaged image.
+
+**Root cause, confirmed.** pseudo (Yocto's fakeroot) intercepts filesystem syscalls
+via `LD_PRELOAD`. Host kernel 6.17 emitted syscall variants the walnascar-era pseudo
+could not decode, so it returned `EFAULT`. A host/tooling incompatibility, never a
+fault in the recipes.
+
+**Resolution.** The Debian host runs **kernel 6.12** — within the range this Yocto
+release's pseudo expects. On the new host the full image — packaging, rootfs, wic,
+all of it — **builds clean, with no pseudo error anywhere.** The driver, overlay,
+and master now package into the image and the driver auto-loads at boot; the SCP
+workaround is retired.
+
+**Lesson.** The single most valuable diagnostic realization of the whole project:
+a bug that surfaced across three unrelated recipes was one host-environment cause,
+not three recipe bugs. And the fix was environmental, not code. This is exactly the
+problem containerized/pinned builds exist to solve — build correctness depends on
+the host, not just the recipes. (If a matching-kernel host isn't available, the
+equivalent fix is a build container with a compatible userspace.)
+
+### MIG-2 — UNPACKDIR does not exist on scarthgap (inverse of YOCTO-3)
+
+**Symptom.** After cloning the walnascar recipes onto scarthgap, three custom
+recipes failed:
+- overlay `do_unpack`: `Directory name ${@d.getVar('S') contains unexpanded bitbake variable`
+- master `do_compile`: `cc1: fatal error: modbus_master.c: No such file or directory`
+- driver `do_compile`: `make: *** No targets specified and no makefile found`
+
+**Root cause.** `UNPACKDIR` was introduced in the 5.1 dev cycle (walnascar). It
+**does not exist on scarthgap (5.0).** The recipes carried the walnascar pattern
+`S = "${WORKDIR}/sources"` + `UNPACKDIR = "${S}"` (and the overlay's
+`S = "${UNPACKDIR}"`). On scarthgap, `UNPACKDIR` is undefined → the overlay's `S`
+references an unexpanded variable, and the driver/master look for source in a
+directory that doesn't get populated → files "not found".
+
+**Fix.** Remove all `UNPACKDIR` lines and set `S = "${WORKDIR}"`. On scarthgap,
+`file://` sources unpack straight into `${WORKDIR}` and building there is fully
+supported (the "S=WORKDIR unsupported" error is a *walnascar* thing — the exact
+inverse). Three recipes changed; all compiled after.
+
+**Lesson.** This is the mirror image of YOCTO-3. walnascar *required* the
+`sources`/`UNPACKDIR` split; scarthgap doesn't *have* it. A recipe correct on one
+release is wrong on the other. Match the recipe idiom to the exact release — and
+note that "downgrading" LTS is not always simpler, it's just *different*.
+
+### MIG-3 — scarthgap layer compat
+
+**Symptom.** `bitbake-layers add-layer ../meta-fieldbus` would refuse the layer, or
+parsing errors on `LAYERSERIES_COMPAT`.
+
+**Root cause / fix.** `conf/layer.conf` named walnascar:
+```
+LAYERSERIES_COMPAT_meta-fieldbus = "walnascar"
+```
+Change to `scarthgap`. Every layer declares which release series it supports; a
+mismatch is a hard refusal.
+
+### MIG-4 — verify scarthgap ships a >=6.12 kernel BEFORE committing to it
+
+**The check that gated the whole release decision.** scarthgap historically shipped
+linux-raspberrypi 6.6 by default, and `CONFIG_PREEMPT_RT` only exists mainline from
+6.12. Before committing:
+```bash
+ls meta-raspberrypi/recipes-kernel/linux/
+```
+This particular scarthgap meta-raspberrypi checkout had `linux-raspberrypi_6.12.bb`
+— so scarthgap (LTS) *and* the RT kernel were both available. If it had shown only
+6.6, the fallback was to stay on walnascar. **Confirm the kernel version a release
+offers before building on it** — the RT requirement drives the release choice, not
+the other way around.
+
+### MIG-5 — Debian locale not set for bitbake
+
+**Symptom.** `bitbake` aborts immediately:
+```
+locale.Error: unsupported locale setting
+```
+
+**Root cause.** Debian generated `en_IN.UTF-8` (or none) but not the `en_US.UTF-8`
+bitbake requires, and `oe-init-build-env` sanitizes the environment so the variables
+must be exported *before* sourcing it.
+
+**Fix.**
+```bash
+sudo sed -i 's/^# *en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen
+sudo locale-gen
+export LANG=en_US.UTF-8
+export LC_ALL=en_US.UTF-8
+# then source oe-init-build-env
+```
+Made permanent by adding the two `export` lines to `~/.bashrc`.
+
+### MIG-6 — obsolete package name on trixie
+
+**Symptom.** `apt install ... liblz4-tool` → `Package 'liblz4-tool' has no
+installation candidate`.
+
+**Root cause / fix.** `liblz4-tool` was folded into the `lz4` package on Debian
+trixie. Install `lz4` instead. (Trivial, but it aborts the whole apt line, so the
+rest of the prereqs look uninstalled until you re-run.)
+
+### MIG-7 — setup_sshd failed: sshd_config not present
+
+**Symptom.** `do_rootfs` failed at the very end:
+```
+sed: can't read .../rootfs/etc/ssh/sshd_config: No such file or directory
+```
+All other postprocess functions (unlock_root, setup_wifi, setup_wifi_initd) had
+already succeeded.
+
+**Root cause.** The `setup_sshd` postprocess function edits `/etc/ssh/sshd_config`,
+but the openssh **server** wasn't installed, so the file didn't exist. `EXTRA_IMAGE_FEATURES`
+lacked `ssh-server-openssh` in this build's local.conf.
+
+**Fix.** Two parts:
+1. `EXTRA_IMAGE_FEATURES = "ssh-server-openssh allow-root-login"` in local.conf.
+2. Guard the function so a missing file can't hard-fail the rootfs:
+   ```bash
+   setup_sshd() {
+       if [ -f ${IMAGE_ROOTFS}/etc/ssh/sshd_config ]; then
+           sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' ${IMAGE_ROOTFS}/etc/ssh/sshd_config
+           sed -i 's/^#*PermitEmptyPasswords.*/PermitEmptyPasswords yes/' ${IMAGE_ROOTFS}/etc/ssh/sshd_config
+           echo 'UseDNS no' >> ${IMAGE_ROOTFS}/etc/ssh/sshd_config
+       fi
+   }
+   ```
+**Lesson.** A postprocess function that edits a package-owned file must not assume
+the package is installed. Guard the edit, and make the dependency explicit.
+
+### MIG-8 — SD-card auto-remount defeats umount; and root SSH login
+
+**Symptom A.** `umount /dev/sdc*` "succeeds" then the partition is immediately
+remounted by the Debian desktop — bmaptool then can't get the device.
+
+**Fix A.** Use the desktop mounter's own unmount, which tells it to let go:
+```bash
+udisksctl unmount -b /dev/sdc1
+udisksctl unmount -b /dev/sdc2
+```
+
+**Symptom B.** After flashing, `ssh root@<pi>` rejected the password even though
+`/etc/shadow` showed `root::` (unlocked) and sshd_config had `PermitRootLogin yes`
++ `PermitEmptyPasswords yes`.
+
+**Fix B.** Empty-password root-over-SSH is blocked by some openssh builds regardless
+of config. Set a real password by patching the card's shadow directly:
+```bash
+sudo mount /dev/sdc2 /mnt/piroot
+HASH=$(openssl passwd -6 root)
+sudo sed -i "s|^root:[^:]*:|root:${HASH}:|" /mnt/piroot/etc/shadow
+sudo umount /mnt/piroot && sync
+```
+Then `ssh root@<pi>` with password `root`. Cleaner than empty for a networked device
+anyway.
+
+### MIG-9 — flashing the wrong device (near miss)
+
+**Symptom.** `lsblk` showed `sdc` (29.7 G, with `boot`/`root` labels) and `sdd`
+(0 B). `sdd` at 0 B is an empty card reader; `sdc` was a card with an existing OS.
+
+**Lesson.** Always confirm the target with `lsblk -o NAME,SIZE,LABEL,MOUNTPOINTS`
+before `bmaptool`. A 0 B device has no card inserted. A device with `boot`/`root`
+labels may be a card you care about — check before overwriting. Flash the **whole
+device** (`/dev/sdc`), never a partition — the wic image carries its own table.
+
+### THE RESULT — full stack working on hardware
+
+After the migration, the first live end-to-end exchange succeeded:
+```
+frames_ok:  0 -> 1 -> 2 -> 3    every request answered
+crc_errors: 0                   zero bad frames
+```
+Response frame captured: `01 03 08 00 64 00 c8 01 2c 01 90 90 08` — function 0x03,
+8 data bytes, registers 100/200/300/400, CRC valid. The Pi master, kernel driver,
+RS485 bus, and STM32 slave all work together. The self-contained image boots,
+`uname` shows `PREEMPT_RT 6.12.93-v8`, and `modbus_drv` auto-loads at boot.
+
+---
+
 ## Meta-process — three habits that did the heavy lifting
 
 1. **Read the actual error; identify the layer.** Nearly every fix came from the
@@ -372,14 +566,24 @@ subsystem docs/headers for what a callback's return is expected to mean.
 
 2. **Distinguish blockers from nuisances.** The pseudo bug (YOCTO-5) is the case
    study: hours of effort to fix vs. zero cost to route around via SCP. Deferring
-   it kept the whole project moving.
+   it kept the whole project moving — and it later turned out (MIG-1) to be a
+   host-kernel incompatibility that vanished on a different host, vindicating the
+   decision to route around rather than fight it.
 
 3. **Verify state; do not assume it.** Checking the work-dir path (revealed kernel
    6.6), grepping the deployed `.config`, watching `dmesg` for the probe line —
    build systems and boot flows fail silently, so confirming ground truth beat
    trusting that a change took effect.
 
+4. **Suspect the host, not just the code.** The single hardest bug (pseudo) was
+   never in the recipes — it was the build host's kernel. When a failure spans
+   multiple unrelated components, the common factor is often the environment. Build
+   reproducibility is a first-class concern, not an afterthought.
+
 ---
 
-*Maintained alongside the driver increments (4a–4d). Add new entries as they occur;
-the value of this file is the reasoning, not just the fix.*
+*Maintained across the Ubuntu/walnascar build and the Debian/scarthgap rebuild.
+The value of this file is the reasoning, not just the fix — every entry names the
+root cause and the general lesson, because the same class of bug recurs in new
+disguises. The project reached a working end-to-end state on hardware: the story
+here is how it got there.*
