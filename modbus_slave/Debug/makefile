@@ -60,8 +60,8 @@ all: main-build
 main-build: modbus_slave.elf secondary-outputs
 
 # Tool invocations
-modbus_slave.elf modbus_slave.map: $(OBJS) $(USER_OBJS) /home/panicsoft/fieldbus/meta-fieldbus/modbus_slave/STM32F446RETX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
-	arm-none-eabi-gcc -o "modbus_slave.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m4 -T"/home/panicsoft/fieldbus/meta-fieldbus/modbus_slave/STM32F446RETX_FLASH.ld" --specs=nosys.specs -Wl,-Map="modbus_slave.map" -Wl,--gc-sections -static --specs=nano.specs -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
+modbus_slave.elf modbus_slave.map: $(OBJS) $(USER_OBJS) /home/panicsoft/yocto/meta-fieldbus/modbus_slave/STM32F446RETX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
+	arm-none-eabi-gcc -o "modbus_slave.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m4 -T"/home/panicsoft/yocto/meta-fieldbus/modbus_slave/STM32F446RETX_FLASH.ld" --specs=nosys.specs -Wl,-Map="modbus_slave.map" -Wl,--gc-sections -static --specs=nano.specs -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
 	@echo 'Finished building target: $@'
 	@echo ' '
 
