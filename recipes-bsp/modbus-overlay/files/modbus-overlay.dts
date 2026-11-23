@@ -1,0 +1,14 @@
+/dts-v1/;
+/plugin/;
+/ {
+	compatible = "brcm,bcm2837";
+	fragment@0 {
+		target = <&uart0>;
+		__overlay__ {
+			status = "okay";
+			modbus: modbus@0 {
+				compatible = "dinesh,modbus-rtu";
+			};
+		};
+	};
+};

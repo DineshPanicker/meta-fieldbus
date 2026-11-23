@@ -1,0 +1,1 @@
+/usr/bin/c++ -fsanitize=address,undefined -fno-omit-frame-pointer -g -Wl,--dependency-file=CMakeFiles/modbus_master.dir/link.d CMakeFiles/modbus_master.dir/src/main.cpp.o CMakeFiles/modbus_master.dir/src/gpio_line.cpp.o CMakeFiles/modbus_master.dir/src/modbus_port.cpp.o CMakeFiles/modbus_master.dir/src/rt.cpp.o -o modbus_master
